@@ -785,12 +785,13 @@ class Trainer:
                     "weight_decay": 0.0,
                 },
             ]
-            optimizer_cls = Adafactor if self.args.adafactor else AdamW
+            from onnxruntime.training.optim.fused_adam import FusedAdam as ORTFusedAdam
+            optimizer_cls = Adafactor if self.args.adafactor else ORTFusedAdam
             if self.args.adafactor:
                 optimizer_cls = Adafactor
                 optimizer_kwargs = {"scale_parameter": False, "relative_step": False}
             else:
-                optimizer_cls = AdamW
+                optimizer_cls = ORTFusedAdam
                 optimizer_kwargs = {
                     "betas": (self.args.adam_beta1, self.args.adam_beta2),
                     "eps": self.args.adam_epsilon,
@@ -931,6 +932,19 @@ class Trainer:
         # Mixed precision training with apex (torch < 1.6)
         if self.use_apex and training:
             model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
+            from onnxruntime.training.optim.fp16_optimizer import FP16_Optimizer as ORT_FP16_Optimizer
+            self.optimizer = ORT_FP16_Optimizer(self.optimizer)
+
+            if self.args.ort:
+                def patch_new_fwd(old_new_fwd):
+                    def new_new_fwd(self, *args, **kwargs):
+                        return old_new_fwd(*args, **kwargs)
+                    return new_new_fwd
+                import types
+                from torch_ort import ORTModule
+                model.forward = types.MethodType(patch_new_fwd(model.forward), model)
+                model = ORTModule(model)
+                print("ORTModule wrap for Apex runs")
 
         # Multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
@@ -1103,9 +1117,10 @@ class Trainer:
             debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
 
         delay_optimizer_creation = self.sharded_ddp is not None and self.sharded_ddp != ShardedDDPOption.SIMPLE
-        if args.ort:
+        if args.ort and not self.use_apex:
+            # do ORTModule wrap for use_apex=True case.
             from torch_ort import ORTModule
-            logger.info("Converting to ORTModule ....")
+            print("Converting to ORTModule ....")
             model = ORTModule(self.model)
             self.model_wrapped = model
         if args.deepspeed:
